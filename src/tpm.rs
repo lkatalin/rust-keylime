@@ -83,3 +83,27 @@ pub(crate) fn create_ek(
 
     Ok((handle, cert, tpm_pub_vec))
 }
+
+/* Retrieves an existing ek_handle from keylime.conf.
+ *
+ * Input: None
+ * Return: Key handle
+ *
+ * Example call:
+ * let ek_handle = tpm::get_ek();
+ */
+
+pub(crate) fn get_ek() -> Result<KeyHandle> {
+    let cfg_handle =
+        config_get("/etc/keylime.conf", "cloud_agent", "ek_handle")?;
+    let handle = match cfg_handle.as_str() {
+        "generate" => {
+            return Err(KeylimeError::Configuration(String::from(
+                "No EK handle provided in keylime.conf",
+            )));
+        }
+        string => string,
+    };
+
+    Ok(KeyHandle::from(u32::from_str_radix(handle, 16)?))
+}
