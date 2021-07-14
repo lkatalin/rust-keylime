@@ -168,11 +168,18 @@ pub(crate) fn pcrdata_to_vec(
     selection_list: PcrSelectionList,
     pcrdata: PcrData,
 ) -> Vec<u8> {
+    println!("pcr_selection: {:?}", selection_list);
     let pcrsel: TPML_PCR_SELECTION = selection_list.into();
     let pcrsel_vec: [u8; 132] = unsafe { std::mem::transmute(pcrsel) };
+    println!("pcrsel_vec: {:?}", pcrsel_vec);
+    println!(
+        "Rebuilt pcr_selection: {:?}",
+        PcrSelectionList::try_from(pcrsel)
+    );
 
     let digest: TPML_DIGEST = pcrdata.into();
     let digest_vec: [u8; 532] = unsafe { std::mem::transmute(digest) };
+    println!("digest_vec: {:?}", digest_vec);
 
     let mut data_vec =
         Vec::with_capacity(pcrsel_vec.len() + 4 + digest_vec.len());
@@ -525,13 +532,22 @@ pub(crate) fn build_pcr_list(
     let ima_pcr_index = pcrs.iter().position(|&pcr| pcr == PcrSlot::Slot10);
 
     let mut pcrlist = PcrSelectionListBuilder::new();
-    pcrlist = pcrlist.with_selection(HashingAlgorithm::Sha1, &pcrs);
+
+    // remove IMA pcr before selecting for sha256 bank
     if let Some(ima_pcr_index) = ima_pcr_index {
         let _ = pcrs.remove(ima_pcr_index);
+
+        // add only IMA pcr for sha1 bank
+        let mut sha1_pcrs = Vec::new();
+        sha1_pcrs.push(PcrSlot::Slot10);
+        pcrlist = pcrlist.with_selection(HashingAlgorithm::Sha1, &sha1_pcrs);
     }
     pcrlist = pcrlist.with_selection(HashingAlgorithm::Sha256, &pcrs);
+    let pcrlist = pcrlist.build();
 
-    Ok(pcrlist.build())
+    log::info!("Total PCR list: {:?}", pcrlist);
+
+    Ok(pcrlist)
 }
 
 // The pcr blob corresponds to the pcr out file that records the list of PCR values,
@@ -551,6 +567,8 @@ pub(crate) fn make_pcr_blob(
     context: &mut Context,
     pcrlist: PcrSelectionList,
 ) -> Result<(PcrSelectionList, PcrData)> {
+    info!("Creating PCR blob for {:?}", pcrlist);
+
     let (_, pcrs_read, pcr_data) =
         context.execute_without_session(|ctx| ctx.pcr_read(&pcrlist))?;
     if pcrs_read != pcrlist {
@@ -561,6 +579,42 @@ pub(crate) fn make_pcr_blob(
     }
 
     Ok((pcrs_read, pcr_data))
+}
+
+const NUM_ATTESTATION_ATTEMPTS: i32 = 5;
+
+fn perform_quote_and_pcr_read(
+    mut context: &mut Context,
+    ak_handle: KeyHandle,
+    nonce: &[u8],
+    pcrlist: PcrSelectionList,
+) -> Result<(TPM2B_ATTEST, Signature, PcrSelectionList, PcrData)> {
+    let sig_scheme = get_sig_scheme(TpmSigScheme::default())?;
+    let nonce = nonce.try_into()?;
+
+    for _attempt in 0..NUM_ATTESTATION_ATTEMPTS {
+        // TSS ESAPI quote does not create pcr blob, so create it separately
+        let (pcrs_read, pcr_data) =
+            make_pcr_blob(&mut context, pcrlist.clone())?;
+
+        // create quote
+        let (attestation, sig) = context.quote(
+            ak_handle,
+            &nonce,
+            sig_scheme,
+            pcrs_read.clone(),
+        )?;
+
+        // Check whether the attestation and pcr_data match
+        if (true) {
+            return Ok((attestation, sig, pcrs_read, pcr_data));
+        }
+    }
+
+    Err(KeylimeError::Other(
+        "Consistent race condition: can't make attestation match pcr_data"
+            .to_string(),
+    ))
 }
 
 // Despite the return type, this function is used for both Identity and
@@ -579,21 +633,16 @@ pub(crate) fn quote(
     let mut context = data.tpmcontext.lock().unwrap(); //#[allow_ci]
 
     let pcrlist = build_pcr_list(&mut context, nk_digest, mask)?;
-    let sig_scheme = get_sig_scheme(TpmSigScheme::default())?;
 
-    // create quote
-    let (attestation, sig) =
-        context.execute_with_nullauth_session(|ctx| {
-            ctx.quote(
+    let (attestation, sig, pcrs_read, pcr_data) = context
+        .execute_with_nullauth_session(|mut ctx| {
+            perform_quote_and_pcr_read(
+                &mut ctx,
                 data.ak_handle,
-                &nonce.try_into()?,
-                sig_scheme,
-                pcrlist.clone(),
+                nonce,
+                pcrlist,
             )
         })?;
-
-    // TSS ESAPI quote does not create pcr blob, so create it separately
-    let (pcrs_read, pcr_data) = make_pcr_blob(&mut context, pcrlist)?;
 
     let quote = encode_quote_string(attestation, sig, pcrs_read, pcr_data)?;
 
